@@ -56,19 +56,19 @@ def resolver_pergunta(pergunta: str):
     texto = pergunta.lower()
     print(f"\nPergunta recebida: {pergunta}")
 
-    # Exemplo: log2(4096) ou log2 (4096)
+    # log2(8192), log2 (8192), etc.
     match = re.search(r"log2\s*\(\s*(\d+)\s*\)", texto)
     if match:
         n = int(match.group(1))
         return str(int(math.log2(n)))
 
-    # Exemplo: raiz quadrada de 144
+    # raiz quadrada de 144
     match = re.search(r"raiz quadrada de\s*(\d+)", texto)
     if match:
         n = int(match.group(1))
         return str(int(math.sqrt(n)))
 
-    # Exemplo: 10 + 5, 20 - 3, 7 * 8, 100 / 4
+    # 10 + 5, 20 - 3, 7 * 8, 100 / 4
     match = re.search(r"(-?\d+)\s*([\+\-\*/])\s*(-?\d+)", texto)
     if match:
         a = int(match.group(1))
@@ -77,19 +77,22 @@ def resolver_pergunta(pergunta: str):
 
         if op == "+":
             return str(a + b)
+
         if op == "-":
             return str(a - b)
+
         if op == "*":
             return str(a * b)
+
         if op == "/":
             resultado = a / b
             if resultado.is_integer():
                 return str(int(resultado))
             return str(resultado)
 
-    print("Não consegui resolver automaticamente.")
-    resposta = input("Digite apenas o número da resposta: ").strip()
-    return resposta
+    print("\nNão consegui resolver automaticamente.")
+    print("Resposta NÃO enviada para evitar erro.")
+    return None
 
 
 def publicar_identidade():
@@ -107,10 +110,10 @@ def publicar_identidade():
     }
 
     topico = f"{TOPICO_CHAVES}/{ID_UNIDADE}"
-
-    client.publish(topico, json.dumps(pacote), retain=True)
+    resultado = client.publish(topico, json.dumps(pacote), retain=True)
 
     print(f"\nIdentidade publicada em: {topico}")
+    print("Status publish:", resultado.rc)
 
 
 def solicitar_desafio():
@@ -119,12 +122,14 @@ def solicitar_desafio():
         "cmd": "desafio"
     }
 
-    client.publish(TOPICO_ORACULO, json.dumps(pacote))
+    resultado = client.publish(TOPICO_ORACULO, json.dumps(pacote))
+
     print("\nDesafio solicitado ao Oráculo.")
+    print("Status publish:", resultado.rc)
 
 
 def enviar_echo_oraculo():
-    enviar_mensagem_segura("oraculo", "teste", cmd="echo")
+    enviar_mensagem_segura("oraculo", "echo-ut-delta", cmd="echo")
 
 
 def enviar_resposta_oraculo(resposta: str):
@@ -133,6 +138,8 @@ def enviar_resposta_oraculo(resposta: str):
 
 def enviar_mensagem_segura(destino: str, mensagem: str, cmd=None):
     global rsa_private, ecdsa_private
+
+    destino = destino.lower()
 
     if destino not in chaves_confiadas:
         print(f"\nNão tenho chave pública de {destino}.")
@@ -158,9 +165,11 @@ def enviar_mensagem_segura(destino: str, mensagem: str, cmd=None):
     else:
         topico = f"sisdef/direto/{destino}"
 
-    client.publish(topico, json.dumps(pacote))
+    resultado = client.publish(topico, json.dumps(pacote))
+
     print(f"\nMensagem segura enviada para {destino}.")
     print(f"Tópico: {topico}")
+    print("Status publish:", resultado.rc)
 
 
 def processar_chave_publica(payload: dict):
@@ -169,15 +178,25 @@ def processar_chave_publica(payload: dict):
     if not id_remetente:
         return
 
+    id_remetente = id_remetente.lower()
+
     if "chave_publica_rsa" not in payload:
         return
 
-    if "chave_publica_ecdsa" not in payload:
+    chave_ecdsa = payload.get("chave_publica_ecdsa")
+
+    # Algumas equipes publicaram como chave_publica_eddsa,
+    # mas o conteúdo é uma chave ECDSA secp256r1.
+    if chave_ecdsa is None:
+        chave_ecdsa = payload.get("chave_publica_eddsa")
+
+    if chave_ecdsa is None:
+        print(f"\nChave de assinatura ausente para {id_remetente}.")
         return
 
     chaves_confiadas[id_remetente] = {
         "chave_publica_rsa": payload["chave_publica_rsa"],
-        "chave_publica_ecdsa": payload["chave_publica_ecdsa"]
+        "chave_publica_ecdsa": chave_ecdsa
     }
 
     salvar_chaves_confiadas()
@@ -190,6 +209,8 @@ def processar_revogacao(payload: dict):
 
     if not id_revogada:
         return
+
+    id_revogada = id_revogada.lower()
 
     if id_revogada in chaves_confiadas:
         del chaves_confiadas[id_revogada]
@@ -207,6 +228,8 @@ def processar_mensagem_direta(payload: dict):
     if not remetente:
         print("\nMensagem direta sem id_unidade.")
         return
+
+    remetente = remetente.lower()
 
     if remetente == ID_UNIDADE:
         return
@@ -232,12 +255,27 @@ def processar_mensagem_direta(payload: dict):
         print(f"Conteúdo: {mensagem}")
 
         if remetente == "oraculo":
-            resposta = resolver_pergunta(mensagem)
-            print(f"Resposta calculada: {resposta}")
-            confirmar = input("Enviar resposta ao Oráculo? [s/n]: ").strip().lower()
+            texto = mensagem.lower()
 
-            if confirmar == "s":
-                enviar_resposta_oraculo(resposta)
+            # Echo do Oráculo: só confirma funcionamento.
+            if "oraculo esta operante" in texto or "suas chaves foram recebidas" in texto:
+                print("\nEcho do Oráculo recebido com sucesso.")
+                print("O Oráculo confirmou que está operante e que recebeu suas chaves.")
+                return
+
+            # Desafio real: calcula e envia automaticamente.
+            resposta = resolver_pergunta(mensagem)
+
+            if resposta is None:
+                print("\nNão enviei resposta porque não consegui calcular automaticamente.")
+                return
+
+            print(f"Resposta calculada: {resposta}")
+
+            enviar_resposta_oraculo(resposta)
+
+            print("\nResposta enviada automaticamente ao Oráculo.")
+            return
 
     except Exception as e:
         print("\nErro ao processar mensagem segura.")
@@ -307,9 +345,14 @@ def on_message(client, userdata, msg):
 
 
 def gerar_minhas_chaves():
-    rsa_p, ecdsa_p = gerar_chaves()
-    salvar_chaves(rsa_p, ecdsa_p)
+    global rsa_private, ecdsa_private
+
+    rsa_private, ecdsa_private = gerar_chaves()
+    salvar_chaves(rsa_private, ecdsa_private)
+
     print("\nChaves geradas e salvas em minhas_chaves.json.")
+    print("As chaves em memória também foram atualizadas.")
+    print("Agora publique a identidade novamente usando a opção 2.")
 
 
 def revogar_unidade():
@@ -319,8 +362,10 @@ def revogar_unidade():
         "id_unidade": id_revogada
     }
 
-    client.publish(TOPICO_REVOGACAO, json.dumps(pacote))
+    resultado = client.publish(TOPICO_REVOGACAO, json.dumps(pacote))
+
     print(f"\nRevogação publicada para: {id_revogada}")
+    print("Status publish:", resultado.rc)
 
 
 def consultar_notas():
@@ -328,8 +373,10 @@ def consultar_notas():
         "cmd": "atualizar_notas"
     }
 
-    client.publish(TOPICO_NOTAS, json.dumps(pacote))
+    resultado = client.publish(TOPICO_NOTAS, json.dumps(pacote))
+
     print("\nSolicitação de atualização de notas enviada.")
+    print("Status publish:", resultado.rc)
 
 
 def listar_chaves():
@@ -339,7 +386,7 @@ def listar_chaves():
         print("Nenhuma chave salva ainda.")
         return
 
-    for unidade in chaves_confiadas:
+    for unidade in sorted(chaves_confiadas.keys()):
         print(f"- {unidade}")
 
 
@@ -348,7 +395,7 @@ def menu():
         print("\n========== UT-DELTA ==========")
         print("1 - Gerar minhas chaves")
         print("2 - Publicar identidade")
-        print("3 - Enviar echo para o Oráculo")
+        print("3 - Enviar echo criptografado para o Oráculo")
         print("4 - Solicitar desafio ao Oráculo")
         print("5 - Enviar mensagem para outra UT")
         print("6 - Listar chaves confiadas")
@@ -401,7 +448,7 @@ def iniciar():
 
     if not os.path.exists("minhas_chaves.json"):
         print("Arquivo minhas_chaves.json não encontrado.")
-        print("Use a opção 1 para gerar as chaves primeiro.")
+        print("Gerando chaves automaticamente...")
         gerar_minhas_chaves()
 
     rsa_private, ecdsa_private = carregar_chaves()
