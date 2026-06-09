@@ -6,3 +6,4 @@ __pycache__/
 *.key
 minhas_chaves.json
 chaves_confiadas.json
+docs/
