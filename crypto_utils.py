@@ -128,6 +128,38 @@ def verificar_assinatura(mensagem: str, assinatura: bytes, ecdsa_public) -> bool
         return False
 
 
+def serializar_json_canonico(objeto: dict) -> bytes:
+    return json.dumps(
+        objeto,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False
+    ).encode("utf-8")
+
+
+def assinar_objeto_json(objeto: dict, ecdsa_private) -> bytes:
+    return ecdsa_private.sign(
+        serializar_json_canonico(objeto),
+        ec.ECDSA(hashes.SHA256())
+    )
+
+
+def verificar_assinatura_objeto_json(
+    objeto: dict,
+    assinatura: bytes,
+    ecdsa_public
+) -> bool:
+    try:
+        ecdsa_public.verify(
+            assinatura,
+            serializar_json_canonico(objeto),
+            ec.ECDSA(hashes.SHA256())
+        )
+        return True
+    except InvalidSignature:
+        return False
+
+
 def montar_pacote_seguro(id_unidade: str, mensagem: str, rsa_public_destino, ecdsa_private, cmd=None):
     chave_aes = AESGCM.generate_key(bit_length=256)
     aesgcm = AESGCM(chave_aes)

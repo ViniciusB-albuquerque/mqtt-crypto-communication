@@ -3,9 +3,12 @@ import os
 import re
 import math
 import time
+from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 
 from crypto_utils import (
+    b64d,
+    b64e,
     gerar_chaves,
     salvar_chaves,
     carregar_chaves,
@@ -13,7 +16,9 @@ from crypto_utils import (
     carregar_publica_rsa_b64,
     carregar_publica_ecdsa_b64,
     montar_pacote_seguro,
-    abrir_pacote_seguro
+    abrir_pacote_seguro,
+    assinar_objeto_json,
+    verificar_assinatura_objeto_json
 )
 
 
@@ -29,11 +34,14 @@ TOPICO_REVOGACAO = "sisdef/broadcast/revogacao"
 TOPICO_NOTAS = "sisdef/broadcast/notas"
 
 ARQUIVO_CHAVES_CONFIADAS = "chaves_confiadas.json"
+ARQUIVO_UNIDADES_REVOGADAS = "unidades_revogadas.json"
 
 client = mqtt.Client()
 chaves_confiadas = {}
+unidades_revogadas = set()
 rsa_private = None
 ecdsa_private = None
+desafio_pendente = False
 
 
 def carregar_chaves_confiadas():
@@ -52,6 +60,45 @@ def salvar_chaves_confiadas():
         json.dump(chaves_confiadas, f, indent=2)
 
 
+def carregar_unidades_revogadas():
+    global unidades_revogadas
+
+    if not os.path.exists(ARQUIVO_UNIDADES_REVOGADAS):
+        unidades_revogadas = set()
+        return
+
+    with open(ARQUIVO_UNIDADES_REVOGADAS, "r", encoding="utf-8") as f:
+        dados = json.load(f)
+
+    unidades_revogadas = {
+        unidade.lower()
+        for unidade in dados.get("unidades_revogadas", [])
+        if isinstance(unidade, str)
+    }
+
+
+def salvar_unidades_revogadas():
+    dados = {
+        "unidades_revogadas": sorted(unidades_revogadas)
+    }
+
+    with open(ARQUIVO_UNIDADES_REVOGADAS, "w", encoding="utf-8") as f:
+        json.dump(dados, f, indent=2)
+
+
+def aplicar_revogacao(id_revogada: str):
+    id_revogada = id_revogada.lower()
+    unidades_revogadas.add(id_revogada)
+    salvar_unidades_revogadas()
+
+    if id_revogada in chaves_confiadas:
+        del chaves_confiadas[id_revogada]
+        salvar_chaves_confiadas()
+        print(f"\nUnidade revogada removida das chaves confiadas: {id_revogada}")
+    else:
+        print(f"\nUnidade adicionada à lista de revogadas: {id_revogada}")
+
+
 def resolver_pergunta(pergunta: str):
     texto = pergunta.lower()
     print(f"\nPergunta recebida: {pergunta}")
@@ -60,13 +107,25 @@ def resolver_pergunta(pergunta: str):
     match = re.search(r"log2\s*\(\s*(\d+)\s*\)", texto)
     if match:
         n = int(match.group(1))
-        return str(int(math.log2(n)))
+        if n > 0 and n & (n - 1) == 0:
+            return str(n.bit_length() - 1)
+        print("\nO log2 encontrado não tem resultado inteiro exato.")
+        print("Resposta NÃO enviada para evitar erro.")
+        return None
 
-    # raiz quadrada de 144
-    match = re.search(r"raiz quadrada de\s*(\d+)", texto)
+    # raiz quadrada de 144, sqrt(144), etc.
+    match = re.search(
+        r"(?:raiz quadrada de\s*(\d+)|sqrt\s*\(\s*(\d+)\s*\))",
+        texto
+    )
     if match:
-        n = int(match.group(1))
-        return str(int(math.sqrt(n)))
+        n = int(match.group(1) or match.group(2))
+        raiz = math.isqrt(n)
+        if raiz * raiz == n:
+            return str(raiz)
+        print("\nA raiz quadrada encontrada não tem resultado inteiro exato.")
+        print("Resposta NÃO enviada para evitar erro.")
+        return None
 
     # 10 + 5, 20 - 3, 7 * 8, 100 / 4
     match = re.search(r"(-?\d+)\s*([\+\-\*/])\s*(-?\d+)", texto)
@@ -85,6 +144,10 @@ def resolver_pergunta(pergunta: str):
             return str(a * b)
 
         if op == "/":
+            if b == 0:
+                print("\nDivisão por zero não pode ser resolvida.")
+                print("Resposta NÃO enviada para evitar erro.")
+                return None
             resultado = a / b
             if resultado.is_integer():
                 return str(int(resultado))
@@ -117,11 +180,14 @@ def publicar_identidade():
 
 
 def solicitar_desafio():
+    global desafio_pendente
+
     pacote = {
         "id_unidade": ID_UNIDADE,
         "cmd": "desafio"
     }
 
+    desafio_pendente = True
     resultado = client.publish(TOPICO_ORACULO, json.dumps(pacote))
 
     print("\nDesafio solicitado ao Oráculo.")
@@ -180,6 +246,10 @@ def processar_chave_publica(payload: dict):
 
     id_remetente = id_remetente.lower()
 
+    if id_remetente in unidades_revogadas:
+        print(f"\nChave ignorada: {id_remetente} está na lista de unidades revogadas.")
+        return
+
     if "chave_publica_rsa" not in payload:
         return
 
@@ -205,23 +275,70 @@ def processar_chave_publica(payload: dict):
 
 
 def processar_revogacao(payload: dict):
-    id_revogada = payload.get("id_unidade")
+    revogacao = payload.get("revogacao")
+    assinatura_b64 = payload.get("assinatura_b64")
+    remetente = payload.get("remetente")
 
-    if not id_revogada:
+    if (
+        isinstance(revogacao, dict)
+        and isinstance(assinatura_b64, str)
+        and isinstance(remetente, str)
+    ):
+        remetente = remetente.lower()
+        id_revogada = revogacao.get("unidade_revogada")
+        timestamp = revogacao.get("timestamp")
+
+        if not isinstance(id_revogada, str) or not isinstance(timestamp, str):
+            print("\nRevogação assinada rejeitada: campos obrigatórios inválidos.")
+            return
+
+        if remetente == ID_UNIDADE:
+            ecdsa_public_remetente = ecdsa_private.public_key()
+        elif remetente in chaves_confiadas:
+            ecdsa_public_remetente = carregar_publica_ecdsa_b64(
+                chaves_confiadas[remetente]["chave_publica_ecdsa"]
+            )
+        else:
+            print(
+                f"\nRevogação assinada rejeitada: "
+                f"chave pública de {remetente} não é confiada."
+            )
+            return
+
+        try:
+            assinatura = b64d(assinatura_b64)
+        except Exception:
+            print("\nRevogação assinada rejeitada: assinatura Base64 inválida.")
+            return
+
+        if not verificar_assinatura_objeto_json(
+            revogacao,
+            assinatura,
+            ecdsa_public_remetente
+        ):
+            print("\nRevogação assinada rejeitada: assinatura ECDSA inválida.")
+            return
+
+        aplicar_revogacao(id_revogada)
+        print(
+            f"Revogação assinada por {remetente} validada "
+            f"(timestamp: {timestamp})."
+        )
         return
 
-    id_revogada = id_revogada.lower()
+    # Compatibilidade com o formato simples já usado no laboratório.
+    id_revogada = payload.get("id_unidade")
 
-    if id_revogada in chaves_confiadas:
-        del chaves_confiadas[id_revogada]
-        salvar_chaves_confiadas()
-        print(f"\nUnidade revogada removida das chaves confiadas: {id_revogada}")
-    else:
-        print(f"\nRevogação recebida para {id_revogada}, mas ela não estava salva.")
+    if not isinstance(id_revogada, str) or not id_revogada:
+        print("\nRevogação rejeitada: formato não reconhecido.")
+        return
+
+    aplicar_revogacao(id_revogada)
+    print("Aviso: revogação simples aplicada sem validação de assinatura.")
 
 
 def processar_mensagem_direta(payload: dict):
-    global rsa_private
+    global rsa_private, desafio_pendente
 
     remetente = payload.get("id_unidade")
 
@@ -232,6 +349,10 @@ def processar_mensagem_direta(payload: dict):
     remetente = remetente.lower()
 
     if remetente == ID_UNIDADE:
+        return
+
+    if remetente in unidades_revogadas:
+        print(f"\nMensagem rejeitada: {remetente} está revogada.")
         return
 
     if remetente not in chaves_confiadas:
@@ -263,8 +384,18 @@ def processar_mensagem_direta(payload: dict):
                 print("O Oráculo confirmou que está operante e que recebeu suas chaves.")
                 return
 
-            # Desafio real: calcula e envia automaticamente.
-            resposta = resolver_pergunta(mensagem)
+            if not desafio_pendente:
+                print(
+                    "\nMensagem segura do Oráculo recebida fora de um "
+                    "desafio pendente. Não respondi automaticamente."
+                )
+                return
+
+            # Desafio real: calcula e envia automaticamente uma única resposta.
+            try:
+                resposta = resolver_pergunta(mensagem)
+            finally:
+                desafio_pendente = False
 
             if resposta is None:
                 print("\nNão enviei resposta porque não consegui calcular automaticamente.")
@@ -358,13 +489,39 @@ def gerar_minhas_chaves():
 def revogar_unidade():
     id_revogada = input("ID da unidade a revogar: ").strip().lower()
 
-    pacote = {
-        "id_unidade": id_revogada
+    if not id_revogada:
+        print("\nRevogação cancelada: informe uma unidade.")
+        return
+
+    revogacao = {
+        "unidade_revogada": id_revogada,
+        "timestamp": datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
     }
+
+    pacote = {
+        "remetente": ID_UNIDADE,
+        "revogacao": revogacao,
+        "assinatura_b64": b64e(
+            assinar_objeto_json(revogacao, ecdsa_private)
+        )
+    }
+
+    print("\nRevogação assinada preparada:")
+    print(json.dumps(pacote, indent=2, ensure_ascii=False))
+
+    confirmacao = input(
+        f"Publicar em {TOPICO_REVOGACAO}? [s/N]: "
+    ).strip().lower()
+
+    if confirmacao not in {"s", "sim"}:
+        print("\nPublicação cancelada. Nenhuma mensagem MQTT foi enviada.")
+        return
 
     resultado = client.publish(TOPICO_REVOGACAO, json.dumps(pacote))
 
-    print(f"\nRevogação publicada para: {id_revogada}")
+    print(f"\nRevogação assinada publicada para: {id_revogada}")
     print("Status publish:", resultado.rc)
 
 
@@ -384,10 +541,16 @@ def listar_chaves():
 
     if not chaves_confiadas:
         print("Nenhuma chave salva ainda.")
-        return
+    else:
+        for unidade in sorted(chaves_confiadas.keys()):
+            print(f"- {unidade}")
 
-    for unidade in sorted(chaves_confiadas.keys()):
-        print(f"- {unidade}")
+    if unidades_revogadas:
+        print("\nUnidades revogadas:")
+        for unidade in sorted(unidades_revogadas):
+            print(f"- {unidade}")
+    else:
+        print("\nNenhuma unidade revogada.")
 
 
 def menu():
@@ -445,6 +608,7 @@ def iniciar():
     global rsa_private, ecdsa_private
 
     carregar_chaves_confiadas()
+    carregar_unidades_revogadas()
 
     if not os.path.exists("minhas_chaves.json"):
         print("Arquivo minhas_chaves.json não encontrado.")
