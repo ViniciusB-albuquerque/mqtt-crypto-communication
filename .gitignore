@@ -4,3 +4,5 @@ __pycache__/
 .env
 *.pem
 *.key
+minhas_chaves.json
+chaves_confiadas.json
