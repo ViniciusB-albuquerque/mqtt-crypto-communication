@@ -68,8 +68,7 @@ a `broker.hivemq.com:1883`, inicia as inscrições MQTT e exibe o menu.
 8. Solicitar atualização e receber a consulta de notas.
 9. Encerrar o cliente.
 
-Gerar novas chaves muda a identidade criptográfica da UT. Na apresentação,
-use as chaves existentes, salvo se a regeneração for realmente necessária.
+Gerar novas chaves muda a identidade criptográfica da UT.
 
 ## Publicação de identidade
 
